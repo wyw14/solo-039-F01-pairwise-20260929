@@ -40,6 +40,7 @@ type Plant struct {
 	FileLog           *journal.FileLog
 	Snapshots         *journal.SnapshotFile
 	FeedMetrics       *feed.Metrics
+	FeedChanges       *feed.ChangeLog
 	RefluxTelemetry   *reflux.Telemetry
 	ReboilerTelemetry *reboiler.Telemetry
 	ProductAudit      *product.Audit
@@ -78,6 +79,7 @@ func NewPlant(dataDir string) *Plant {
 		FileLog:           journal.NewFileLog(filepath.Join(dataDir, "events.jsonl")),
 		Snapshots:         journal.NewSnapshotFile(filepath.Join(dataDir, "snapshot.json")),
 		FeedMetrics:       feed.NewMetrics(),
+		FeedChanges:       feed.NewChangeLog(),
 		RefluxTelemetry:   reflux.NewTelemetry(),
 		ReboilerTelemetry: reboiler.NewTelemetry(),
 		ProductAudit:      product.NewAudit(),
@@ -158,7 +160,6 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 		return model.Campaign{}, err
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
-	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
 	if err := p.record("campaign.transition", grade); err != nil {
 		p.fail(err)
@@ -284,7 +285,7 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "feed_switches": p.FeedChanges.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {
@@ -300,11 +301,20 @@ func (p *Plant) record(kind, payload string) error {
 }
 
 func (p *Plant) observeFeed(value feed.Transition) {
+	// Every stage is folded into the revision-bound switch record, so the
+	// history shows old-source isolation, new-source activation and any failure
+	// point for each switch rather than a single cumulative count.
+	if value.Stage == feed.StageBegin {
+		p.FeedChanges.Begin(value)
+	} else {
+		p.FeedChanges.Apply(value)
+	}
+
 	payload := fmt.Sprintf("%s:%s:%t:%.2f:%s:%t", value.Stage, value.OldSource, value.OldOpen, value.OldFlow, value.NewSource, value.NewOpen)
 	if err := p.record("feed.transition", payload); err != nil {
 		p.fail(err)
 	}
-	if value.Stage == "new-active" {
+	if value.Stage == feed.StageNewActive {
 		p.FeedMetrics.Record(value.NewSource)
 	}
 }
