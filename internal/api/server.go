@@ -15,6 +15,11 @@ type Server struct {
 func NewServer() *Server {
 	plant := service.NewPlant("data")
 	_ = plant.Restore()
+	return NewServerWithPlant(plant)
+}
+
+// NewServerWithPlant 用给定的装置构建服务器（测试与自定义数据目录用）。
+func NewServerWithPlant(plant *service.Plant) *Server {
 	s := &Server{runtime: service.NewRuntime("baseline"), plant: plant, router: chi.NewRouter()}
 	s.routes()
 	return s

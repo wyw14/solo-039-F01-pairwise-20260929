@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
@@ -158,7 +159,6 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 		return model.Campaign{}, err
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
-	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
 	if err := p.record("campaign.transition", grade); err != nil {
 		p.fail(err)
@@ -259,6 +259,9 @@ func (p *Plant) Restore() error {
 	if err := reboiler.Restore(p.Reboiler, snapshot.Reboiler, snapshot.Campaign); err != nil {
 		return err
 	}
+	if err := p.rebuildFeedHistory(); err != nil {
+		return err
+	}
 	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
 		return err
 	}
@@ -284,12 +287,45 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	now := time.Now()
+	return map[string]any{
+		"started":            started,
+		"last_error":         lastError,
+		"campaign":           p.Campaign.Snapshot(),
+		"column":             p.Column.Snapshot(),
+		"reflux_used":        p.Reflux.Used(),
+		"products":           p.ProductTargets(),
+		"relief":             p.Relief.State.Snapshot(),
+		"feed_current":       p.Feed.Current,
+		"feed_previous":      p.Feed.Previous,
+		"feed_metrics":       p.FeedMetrics.Snapshot(),
+		"feed_switches":      p.Feed.Log.List(uuid.Nil, ""),
+		"feed_source_outage": p.Feed.Log.SourceOutage(now),
+		"reflux_telemetry":   p.RefluxTelemetry.Snapshot(),
+		"reboiler_telemetry": p.ReboilerTelemetry.Snapshot(),
+		"product_decisions":  p.ProductAudit.Count(),
+		"utility_used":       p.UtilityLedger.Used(),
+		"metrics":            p.Metrics.Snapshot(),
+		"campaign_changes":   p.CampaignHistory.Count(),
+		"profile_gradient":   gradient,
+		"profile_stable":     p.Profile.Stable(40),
+		"evidence_count":     p.Evidence.Count(p.Campaign.Snapshot().Revision.String()),
+		"relief_attempts":    p.ReliefHistory.Count(),
+		"open_incidents":     p.Incidents.CountOpen(),
+		"operational_audit":  p.OperationalAudit(),
+	}
 }
 
 func (p *Plant) record(kind, payload string) error {
+	return p.recordAt(kind, payload, time.Now())
+}
+
+func (p *Plant) recordAt(kind, payload string, at time.Time) error {
 	event := model.NewEvent(kind, p.Campaign.Snapshot(), payload)
-	event.At = time.Now().UnixNano()
+	if at.IsZero() {
+		at = time.Now()
+	}
+	event.At = at.UnixNano()
 	if err := p.Journal.Append(event); err != nil {
 		return err
 	}
@@ -300,13 +336,63 @@ func (p *Plant) record(kind, payload string) error {
 }
 
 func (p *Plant) observeFeed(value feed.Transition) {
-	payload := fmt.Sprintf("%s:%s:%t:%.2f:%s:%t", value.Stage, value.OldSource, value.OldOpen, value.OldFlow, value.NewSource, value.NewOpen)
-	if err := p.record("feed.transition", payload); err != nil {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		p.fail(err)
+		return
+	}
+	if err := p.recordAt("feed.transition", string(payload), value.At); err != nil {
 		p.fail(err)
 	}
-	if value.Stage == "new-active" {
+	if value.FailedStage == "" && value.Stage == feed.StageNewActive {
 		p.FeedMetrics.Record(value.NewSource)
 	}
+}
+
+// AcknowledgeFeedReceipt 接收现场迟到的进料切换回执。回执按批次修订围栏，
+// 修订已推进时返回 feed.ErrStaleReceipt，当前路线不会被改写。
+func (p *Plant) AcknowledgeFeedReceipt(revision uuid.UUID) (feed.SwitchRecord, error) {
+	return p.Feed.AcknowledgeReceipt(feed.SwitchReceipt{Revision: revision})
+}
+
+// rebuildFeedHistory 从持久化的 feed.transition 事件重放逐次切换记录与当前路线。
+// 重放只让成功的新源启用事件决定路线，迟到事件无法改写当前路线。
+func (p *Plant) rebuildFeedHistory() error {
+	events, err := p.FileLog.Read()
+	if err != nil {
+		return err
+	}
+	stages := make([]feed.StageEvent, 0, len(events))
+	for _, event := range events {
+		if event.Kind != "feed.transition" {
+			continue
+		}
+		var value feed.Transition
+		if err := json.Unmarshal([]byte(event.Payload), &value); err != nil {
+			// 旧版冒号分隔格式不可结构化重放，跳过且不影响其它恢复。
+			continue
+		}
+		at := value.At
+		if event.At != 0 {
+			at = time.Unix(0, event.At)
+		}
+		stages = append(stages, feed.StageEvent{
+			RecordID:    value.RecordID,
+			CampaignID:  event.Campaign,
+			Revision:    event.Revision,
+			Stage:       value.Stage,
+			OldSource:   value.OldSource,
+			OldRevision: value.OldRevision,
+			OldFlow:     value.OldFlow,
+			NewSource:   value.NewSource,
+			NewRevision: value.NewRevision,
+			At:          at,
+			FailedStage: value.FailedStage,
+			Error:       value.Error,
+		})
+	}
+	p.Feed.Replay(stages)
+	return nil
 }
 
 func (p *Plant) fail(err error) {

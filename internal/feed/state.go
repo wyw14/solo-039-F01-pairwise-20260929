@@ -14,7 +14,7 @@ type State struct {
 func New() *State { return &State{route: &Route{}, revision: uuid.New()} }
 
 func (s *State) Open(ctx context.Context, c model.Campaign) error {
-	s.route.Prepare("primary")
+	s.route.Prepare("primary", c.Revision)
 	s.revision = c.Revision
 	return s.route.Activate()
 }

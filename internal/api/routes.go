@@ -21,6 +21,8 @@ func (s *Server) routes() {
 	s.router.Get("/api/recovery", s.recovery)
 	s.router.Get("/api/profile", s.profile)
 	s.router.Get("/api/metrics", s.metrics)
+	s.router.Get("/api/feed/switches", s.feedSwitches)
+	s.router.Post("/api/feed/receipts", s.feedReceipt)
 }
 
 func (s *Server) interlocks(w http.ResponseWriter, r *http.Request) {
